@@ -56,15 +56,29 @@ This plugin maps it to `ext-workspace-v1` as follows:
 - workspace group output membership comes from outputs whose current `wset()` is the group
 - workspace activation maps to `workspace_set_t::request_workspace({x, y})`
 
-Workspace naming and IDs are intentionally simple:
+Workspace IDs are intentionally simple:
 
-- visible name: 1-based linear index, `y * grid_width + x + 1`
 - protocol id: `wset-<workspace-set-index>:<x>,<y>`
 - coordinates: Wayland array containing two `uint32_t` values, `[x, y]`
 
-Only `activate` is advertised as a workspace capability. Group capabilities are
-`0`. Unsupported client requests (`deactivate`, `assign`, `remove`,
-`create_workspace`) are ignored.
+Workspace names come from `ext-workspace-manager/names`, a comma-separated list
+in 1-based linear grid order. Empty or missing entries use the generated
+1-based linear index, `y * grid_width + x + 1`. Workspaces created through the
+protocol use the requested name if the configured list does not override that
+slot.
+
+`activate` is advertised on all workspaces. `remove` is advertised only for
+workspaces on a removable rightmost column or bottom row. Group capabilities
+advertise `create_workspace`. Unsupported client requests (`deactivate`,
+`assign`) are ignored.
+
+Dynamic creation/removal is grid-based:
+
+- `create_workspace` grows the target workspace set by one column.
+- The requested name is stored for the first new workspace in that column when
+  the configured name list does not override it.
+- `remove` shrinks a rightmost column or bottom row; non-edge removal requests
+  are ignored.
 
 ## Implementation Notes
 
@@ -80,8 +94,8 @@ Only `activate` is advertised as a workspace capability. Group capabilities are
   - `workspace_handle_t`
 - Removed protocol handles are retained in retired vectors until clients destroy
   them, so post-`removed` `destroy` requests still have valid user data.
-- `commit` applies the last pending activation per workspace set, then broadcasts
-  a full sync to clients.
+- `commit` applies pending removals, creations, and the last pending activation
+  per workspace set, then broadcasts a sync to clients.
 - `stop` sends `finished` and destroys the manager resource.
 
 ## Wayfire Signals Used
@@ -128,9 +142,5 @@ Expected dry-run install paths:
 
 ## Known Limitations
 
-- No dynamic workspace creation/removal is implemented.
 - No workspace reassignment is implemented.
 - No urgency state is implemented.
-- Workspace names are generated, not user-configurable.
-- The implementation currently sends full sync batches after relevant changes
-  instead of minimizing events.

@@ -93,6 +93,20 @@ static uint32_t workspace_state(std::shared_ptr<wf::workspace_set_t> wset, const
     return 0;
 }
 
+static uint32_t workspace_capabilities(std::shared_ptr<wf::workspace_set_t> wset,
+    const workspace_key_t& key)
+{
+    uint32_t capabilities = EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE;
+    auto grid = wset->get_workspace_grid_size();
+    if (((key.x == grid.width - 1) && (grid.width > 1)) ||
+        ((key.y == grid.height - 1) && (grid.height > 1)))
+    {
+        capabilities |= EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_REMOVE;
+    }
+
+    return capabilities;
+}
+
 static wl_resource *find_output_resource_for_client(wlr_output *output, wl_client *client)
 {
     if (!output)
@@ -123,6 +137,7 @@ struct workspace_handle_t
     bool sent_id = false;
     std::string sent_name;
     uint32_t sent_state = 0;
+    uint32_t sent_capabilities = 0;
     bool sent_details = false;
     bool removed = false;
 };
@@ -191,6 +206,8 @@ struct manager_client_t
     std::vector<std::unique_ptr<group_handle_t>> retired_groups;
     std::vector<std::unique_ptr<workspace_handle_t>> retired_workspaces;
     std::map<uint64_t, wf::point_t> pending_activation;
+    std::vector<std::pair<uint64_t, std::string>> pending_creation;
+    std::vector<workspace_key_t> pending_removal;
 
     manager_client_t(ext_workspace_manager_plugin_t *plugin, wl_resource *resource) :
         plugin(plugin), resource(resource)
@@ -251,12 +268,23 @@ static void handle_workspace_noop(wl_client*, wl_resource*)
 static void handle_workspace_assign(wl_client*, wl_resource*, wl_resource*)
 {}
 
+static void handle_workspace_remove(wl_client*, wl_resource *resource)
+{
+    auto *handle = static_cast<workspace_handle_t*>(wl_resource_get_user_data(resource));
+    if (!handle || handle->removed || !handle->client || handle->client->stopped)
+    {
+        return;
+    }
+
+    handle->client->pending_removal.push_back(handle->key);
+}
+
 static const struct ext_workspace_handle_v1_interface workspace_impl = {
     .destroy = handle_workspace_destroy,
     .activate = handle_workspace_activate,
     .deactivate = handle_workspace_noop,
     .assign = handle_workspace_assign,
-    .remove = handle_workspace_noop,
+    .remove = handle_workspace_remove,
 };
 
 static void workspace_resource_destroyed(wl_resource *resource)
@@ -271,8 +299,16 @@ static void workspace_resource_destroyed(wl_resource *resource)
     }
 }
 
-static void handle_group_create_workspace(wl_client*, wl_resource*, const char*)
-{}
+static void handle_group_create_workspace(wl_client*, wl_resource *resource, const char *name)
+{
+    auto *handle = static_cast<group_handle_t*>(wl_resource_get_user_data(resource));
+    if (!handle || handle->removed || !handle->client || handle->client->stopped)
+    {
+        return;
+    }
+
+    handle->client->pending_creation.push_back({handle->wset_index, name ? name : ""});
+}
 
 static void handle_group_destroy(wl_client*, wl_resource *resource)
 {
@@ -386,6 +422,33 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         retired_clients.erase(it, retired_clients.end());
     }
 
+    void set_workspace_name(const workspace_key_t& key, const std::string& name)
+    {
+        auto trimmed = trim_name(name);
+        if (trimmed.empty())
+        {
+            return;
+        }
+
+        created_workspace_names[key] = trimmed;
+    }
+
+    void forget_workspace_names(uint64_t wset_index, wf::dimensions_t grid)
+    {
+        auto it = created_workspace_names.begin();
+        while (it != created_workspace_names.end())
+        {
+            if ((it->first.wset == wset_index) &&
+                ((it->first.x >= grid.width) || (it->first.y >= grid.height)))
+            {
+                it = created_workspace_names.erase(it);
+            } else
+            {
+                ++it;
+            }
+        }
+    }
+
     std::string get_workspace_name(const workspace_key_t& key, wf::dimensions_t grid)
     {
         auto names = split_workspace_names(workspace_names);
@@ -393,6 +456,12 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         if ((index >= 0) && (static_cast<size_t>(index) < names.size()) && !names[index].empty())
         {
             return names[index];
+        }
+
+        auto created = created_workspace_names.find(key);
+        if (created != created_workspace_names.end())
+        {
+            return created->second;
         }
 
         return workspace_name(key, grid);
@@ -417,6 +486,7 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
 
     wl_global *global = nullptr;
     wf::option_wrapper_t<std::string> workspace_names{"ext-workspace-manager/names"};
+    std::map<workspace_key_t, std::string> created_workspace_names;
     std::vector<std::unique_ptr<manager_client_t>> clients;
     std::vector<std::unique_ptr<manager_client_t>> retired_clients;
     std::vector<std::unique_ptr<tracked_output_t>> tracked_outputs;
@@ -561,7 +631,8 @@ group_handle_t *manager_client_t::ensure_group(uint64_t wset_index)
     groups[wset_index] = std::move(handle);
 
     ext_workspace_manager_v1_send_workspace_group(this->resource, resource);
-    ext_workspace_group_handle_v1_send_capabilities(resource, 0);
+    ext_workspace_group_handle_v1_send_capabilities(resource,
+        EXT_WORKSPACE_GROUP_HANDLE_V1_GROUP_CAPABILITIES_CREATE_WORKSPACE);
     return handle_ptr;
 }
 
@@ -605,6 +676,7 @@ void manager_client_t::send_workspace_details(workspace_handle_t *handle,
     auto id = workspace_id(handle->key);
     auto name = handle->client->plugin->get_workspace_name(handle->key, grid);
     auto state = workspace_state(wset, handle->key);
+    auto capabilities = workspace_capabilities(wset, handle->key);
 
     if (!handle->sent_id)
     {
@@ -640,12 +712,13 @@ void manager_client_t::send_workspace_details(workspace_handle_t *handle,
         handle->sent_state = state;
     }
 
-    if (!handle->sent_details)
+    if (!handle->sent_details || (handle->sent_capabilities != capabilities))
     {
-        ext_workspace_handle_v1_send_capabilities(handle->resource,
-            EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE);
-        handle->sent_details = true;
+        ext_workspace_handle_v1_send_capabilities(handle->resource, capabilities);
+        handle->sent_capabilities = capabilities;
     }
+
+    handle->sent_details = true;
 }
 
 void manager_client_t::sync_group_outputs(group_handle_t *handle, const std::set<wf::output_t*>& outputs)
@@ -821,6 +894,46 @@ void manager_client_t::commit()
     }
 
     auto snapshot = get_current_snapshot();
+
+    for (const auto& key : pending_removal)
+    {
+        auto workspace = snapshot.workspaces.find(key);
+        if (workspace == snapshot.workspaces.end() || !workspace->second)
+        {
+            continue;
+        }
+
+        auto grid = workspace->second->get_workspace_grid_size();
+        wf::dimensions_t next_grid = grid;
+        if ((key.x == grid.width - 1) && (grid.width > 1))
+        {
+            next_grid.width--;
+        } else if ((key.y == grid.height - 1) && (grid.height > 1))
+        {
+            next_grid.height--;
+        } else
+        {
+            continue;
+        }
+
+        workspace->second->set_workspace_grid_size(next_grid);
+        plugin->forget_workspace_names(key.wset, next_grid);
+    }
+
+    for (const auto& [wset_index, name] : pending_creation)
+    {
+        auto group = snapshot.groups.find(wset_index);
+        if ((group == snapshot.groups.end()) || !group->second.wset)
+        {
+            continue;
+        }
+
+        auto grid = group->second.wset->get_workspace_grid_size();
+        workspace_key_t key{wset_index, grid.width, 0};
+        plugin->set_workspace_name(key, name);
+        group->second.wset->set_workspace_grid_size({grid.width + 1, grid.height});
+    }
+
     for (const auto& [wset_index, workspace] : pending_activation)
     {
         auto group = snapshot.groups.find(wset_index);
@@ -832,6 +945,8 @@ void manager_client_t::commit()
     }
 
     pending_activation.clear();
+    pending_creation.clear();
+    pending_removal.clear();
     plugin->broadcast_sync();
 }
 
