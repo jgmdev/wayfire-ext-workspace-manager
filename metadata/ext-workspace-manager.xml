@@ -4,5 +4,10 @@
 		<_short>Ext Workspace Manager Protocol</_short>
 		<_long>An implementation of the ext-workspace-v1 protocol for taskbars, docks and panels.</_long>
 		<category>Utility</category>
+		<option name="names" type="string">
+			<_short>Workspace names</_short>
+			<_long>Comma-separated workspace names in linear grid order. Empty entries use generated numeric names.</_long>
+			<default></default>
+		</option>
 	</plugin>
 </wayfire>

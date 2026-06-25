@@ -11,6 +11,7 @@
 #include <wayland-server-protocol.h>
 
 #include <wayfire/core.hpp>
+#include <wayfire/option-wrapper.hpp>
 #include <wayfire/output-layout.hpp>
 #include <wayfire/output.hpp>
 #include <wayfire/plugin.hpp>
@@ -54,6 +55,31 @@ static std::string workspace_id(const workspace_key_t& key)
 static std::string workspace_name(const workspace_key_t& key, wf::dimensions_t grid)
 {
     return std::to_string(key.y * grid.width + key.x + 1);
+}
+
+static std::string trim_name(const std::string& name)
+{
+    auto first = name.find_first_not_of(" \t");
+    if (first == std::string::npos)
+    {
+        return "";
+    }
+
+    auto last = name.find_last_not_of(" \t");
+    return name.substr(first, last - first + 1);
+}
+
+static std::vector<std::string> split_workspace_names(const std::string& names)
+{
+    std::vector<std::string> result;
+    std::stringstream stream(names);
+    std::string name;
+    while (std::getline(stream, name, ','))
+    {
+        result.push_back(trim_name(name));
+    }
+
+    return result;
 }
 
 static uint32_t workspace_state(std::shared_ptr<wf::workspace_set_t> wset, const workspace_key_t& key)
@@ -298,6 +324,8 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
   public:
     void init() override
     {
+        workspace_names.set_callback([=] () { broadcast_sync(); });
+
         global = wl_global_create(wf::get_core().display, &ext_workspace_manager_v1_interface, 1, this,
             bind_manager);
         wf::get_core().output_layout->connect(&on_output_added);
@@ -358,6 +386,18 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         retired_clients.erase(it, retired_clients.end());
     }
 
+    std::string get_workspace_name(const workspace_key_t& key, wf::dimensions_t grid)
+    {
+        auto names = split_workspace_names(workspace_names);
+        auto index = key.y * grid.width + key.x;
+        if ((index >= 0) && (static_cast<size_t>(index) < names.size()) && !names[index].empty())
+        {
+            return names[index];
+        }
+
+        return workspace_name(key, grid);
+    }
+
     void broadcast_sync()
     {
         for (auto& client : clients)
@@ -376,6 +416,7 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
     };
 
     wl_global *global = nullptr;
+    wf::option_wrapper_t<std::string> workspace_names{"ext-workspace-manager/names"};
     std::vector<std::unique_ptr<manager_client_t>> clients;
     std::vector<std::unique_ptr<manager_client_t>> retired_clients;
     std::vector<std::unique_ptr<tracked_output_t>> tracked_outputs;
@@ -562,7 +603,7 @@ void manager_client_t::send_workspace_details(workspace_handle_t *handle,
 
     auto grid = wset->get_workspace_grid_size();
     auto id = workspace_id(handle->key);
-    auto name = workspace_name(handle->key, grid);
+    auto name = handle->client->plugin->get_workspace_name(handle->key, grid);
     auto state = workspace_state(wset, handle->key);
 
     if (!handle->sent_id)
