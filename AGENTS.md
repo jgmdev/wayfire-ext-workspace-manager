@@ -31,6 +31,15 @@ meson install -C build --dry-run
 Enable the plugin by adding `ext-workspace-manager` to Wayfire's
 `core/plugins` list.
 
+## Commit Preparation
+
+- Use a descriptive commit subject no longer than 50 characters.
+- Wrap commit message body lines at 72 characters.
+- Prepare commit messages in a temporary file and pass it with `git commit -F`;
+  do not use nested `git commit -m` flags.
+- Include the relevant verification commands and results in the body when a
+  change has been tested.
+
 ## Wayfire API
 
 The wayfire API can be inspected on ../wayfire if not it can be cloned from

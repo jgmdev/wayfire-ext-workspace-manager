@@ -189,6 +189,8 @@ struct manager_client_t
     void finish();
     void forget_workspace(workspace_handle_t *handle);
     void forget_group(group_handle_t *handle);
+    bool has_live_resources() const;
+    void maybe_reap();
 
     group_handle_t *ensure_group(uint64_t wset_index);
     workspace_handle_t *ensure_workspace(const workspace_key_t& key);
@@ -205,7 +207,7 @@ static void handle_workspace_destroy(wl_client*, wl_resource *resource)
 static void handle_workspace_activate(wl_client*, wl_resource *resource)
 {
     auto *handle = static_cast<workspace_handle_t*>(wl_resource_get_user_data(resource));
-    if (!handle || handle->removed || !handle->client)
+    if (!handle || handle->removed || !handle->client || handle->client->stopped)
     {
         return;
     }
@@ -232,8 +234,10 @@ static void workspace_resource_destroyed(wl_resource *resource)
     auto *handle = static_cast<workspace_handle_t*>(wl_resource_get_user_data(resource));
     if (handle && handle->client)
     {
+        auto *client = handle->client;
         handle->resource = nullptr;
-        handle->client->forget_workspace(handle);
+        client->forget_workspace(handle);
+        client->maybe_reap();
     }
 }
 
@@ -255,8 +259,10 @@ static void group_resource_destroyed(wl_resource *resource)
     auto *handle = static_cast<group_handle_t*>(wl_resource_get_user_data(resource));
     if (handle && handle->client)
     {
+        auto *client = handle->client;
         handle->resource = nullptr;
-        handle->client->forget_group(handle);
+        client->forget_group(handle);
+        client->maybe_reap();
     }
 }
 
@@ -302,6 +308,7 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
     void fini() override
     {
         clients.clear();
+        retired_clients.clear();
         tracked_outputs.clear();
 
         if (global)
@@ -323,6 +330,30 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         clients.erase(it, clients.end());
     }
 
+    void retire_client(manager_client_t *client)
+    {
+        auto it = std::find_if(clients.begin(), clients.end(),
+            [=] (const auto& item) { return item.get() == client; });
+        if (it == clients.end())
+        {
+            return;
+        }
+
+        auto retired = std::move(*it);
+        clients.erase(it);
+        if (retired->has_live_resources())
+        {
+            retired_clients.push_back(std::move(retired));
+        }
+    }
+
+    void reap_retired_clients()
+    {
+        auto it = std::remove_if(retired_clients.begin(), retired_clients.end(),
+            [] (const auto& client) { return !client->has_live_resources(); });
+        retired_clients.erase(it, retired_clients.end());
+    }
+
     void broadcast_sync()
     {
         for (auto& client : clients)
@@ -342,6 +373,7 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
 
     wl_global *global = nullptr;
     std::vector<std::unique_ptr<manager_client_t>> clients;
+    std::vector<std::unique_ptr<manager_client_t>> retired_clients;
     std::vector<std::unique_ptr<tracked_output_t>> tracked_outputs;
 
     static void bind_manager(wl_client *client, void *data, uint32_t version, uint32_t id)
@@ -367,7 +399,8 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         if (client)
         {
             client->resource = nullptr;
-            client->plugin->remove_client(client);
+            client->stopped = true;
+            client->plugin->retire_client(client);
         }
     }
 
@@ -443,6 +476,20 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         broadcast_sync();
     };
 };
+
+bool manager_client_t::has_live_resources() const
+{
+    return resource || !groups.empty() || !workspaces.empty() ||
+        !retired_groups.empty() || !retired_workspaces.empty();
+}
+
+void manager_client_t::maybe_reap()
+{
+    if (plugin)
+    {
+        plugin->reap_retired_clients();
+    }
+}
 
 group_handle_t *manager_client_t::ensure_group(uint64_t wset_index)
 {
