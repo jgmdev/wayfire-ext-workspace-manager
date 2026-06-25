@@ -16,6 +16,8 @@
 #include <wayfire/output.hpp>
 #include <wayfire/plugin.hpp>
 #include <wayfire/signal-definitions.hpp>
+#include <wayfire/toplevel-view.hpp>
+#include <wayfire/view.hpp>
 #include <wayfire/workspace-set.hpp>
 #include <wayfire/nonstd/wlroots.hpp>
 
@@ -82,7 +84,14 @@ static std::vector<std::string> split_workspace_names(const std::string& names)
     return result;
 }
 
-static uint32_t workspace_state(std::shared_ptr<wf::workspace_set_t> wset, const workspace_key_t& key)
+class ext_workspace_manager_plugin_t;
+struct manager_client_t;
+
+static uint32_t workspace_state(ext_workspace_manager_plugin_t *plugin,
+    std::shared_ptr<wf::workspace_set_t> wset, const workspace_key_t& key);
+
+static uint32_t workspace_base_state(std::shared_ptr<wf::workspace_set_t> wset,
+    const workspace_key_t& key)
 {
     auto current = wset->get_current_workspace();
     if ((current.x == key.x) && (current.y == key.y))
@@ -126,9 +135,6 @@ static wl_resource *find_output_resource_for_client(wlr_output *output, wl_clien
     return nullptr;
 }
 
-class ext_workspace_manager_plugin_t;
-struct manager_client_t;
-
 struct workspace_handle_t
 {
     manager_client_t *client = nullptr;
@@ -162,6 +168,12 @@ struct current_snapshot_t
 {
     std::map<uint64_t, current_group_t> groups;
     std::map<workspace_key_t, std::shared_ptr<wf::workspace_set_t>> workspaces;
+};
+
+struct urgent_view_t
+{
+    wayfire_toplevel_view view;
+    wf::signal::connection_t<wf::view_activated_state_signal> activated;
 };
 
 static current_snapshot_t get_current_snapshot()
@@ -362,6 +374,42 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
     {
         workspace_names.set_callback([=] () { broadcast_sync(); });
 
+        on_view_hints_changed = [=] (wf::view_hints_changed_signal *ev)
+        {
+            if (ev->demands_attention)
+            {
+                track_urgent_view(wf::toplevel_cast(ev->view));
+            } else
+            {
+                untrack_urgent_view(ev->view);
+            }
+
+            broadcast_sync();
+        };
+        wf::get_core().connect(&on_view_hints_changed);
+
+        on_view_system_bell = [=] (wf::view_system_bell_signal *ev)
+        {
+            if (auto toplevel = wf::toplevel_cast(ev->view))
+            {
+                track_urgent_view(toplevel);
+                broadcast_sync();
+            }
+        };
+        wf::get_core().connect(&on_view_system_bell);
+
+        on_view_unmapped = [=] (wf::view_unmapped_signal *ev)
+        {
+            untrack_urgent_view(ev->view);
+        };
+        wf::get_core().connect(&on_view_unmapped);
+
+        on_view_moved_to_wset = [=] (wf::view_moved_to_wset_signal*)
+        {
+            broadcast_sync();
+        };
+        wf::get_core().connect(&on_view_moved_to_wset);
+
         global = wl_global_create(wf::get_core().display, &ext_workspace_manager_v1_interface, 1, this,
             bind_manager);
         wf::get_core().output_layout->connect(&on_output_added);
@@ -375,6 +423,7 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
 
     void fini() override
     {
+        urgent_views.clear();
         clients.clear();
         retired_clients.clear();
         tracked_outputs.clear();
@@ -475,6 +524,58 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         }
     }
 
+    void track_urgent_view(wayfire_toplevel_view view)
+    {
+        if (!view || urgent_views.count(view))
+        {
+            return;
+        }
+
+        auto urgent = std::make_unique<urgent_view_t>();
+        urgent->view = view;
+        urgent->activated = [=] (wf::view_activated_state_signal *ev)
+        {
+            if (ev->view && ev->view->activated)
+            {
+                untrack_urgent_view(ev->view);
+            }
+        };
+        view->connect(&urgent->activated);
+        urgent_views[view] = std::move(urgent);
+    }
+
+    void untrack_urgent_view(wayfire_view view)
+    {
+        if (auto toplevel = wf::toplevel_cast(view))
+        {
+            if (urgent_views.erase(toplevel))
+            {
+                broadcast_sync();
+            }
+        }
+    }
+
+    bool workspace_is_urgent(const workspace_key_t& key)
+    {
+        for (const auto& [view, _] : urgent_views)
+        {
+            if (!view || !view->get_wset() || !view->is_mapped() || view->activated)
+            {
+                continue;
+            }
+
+            auto wset = view->get_wset();
+            auto workspace = wset->get_view_main_workspace(view);
+            if ((static_cast<uint64_t>(wset->get_index()) == key.wset) &&
+                (workspace.x == key.x) && (workspace.y == key.y))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
   private:
     struct tracked_output_t
     {
@@ -482,14 +583,20 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         wf::signal::connection_t<wf::workspace_changed_signal> workspace_changed;
         wf::signal::connection_t<wf::workspace_set_changed_signal> wset_changed;
         wf::signal::connection_t<wf::workspace_grid_changed_signal> grid_changed;
+        wf::signal::connection_t<wf::view_change_workspace_signal> view_workspace_changed;
     };
 
     wl_global *global = nullptr;
     wf::option_wrapper_t<std::string> workspace_names{"ext-workspace-manager/names"};
     std::map<workspace_key_t, std::string> created_workspace_names;
+    std::map<wayfire_toplevel_view, std::unique_ptr<urgent_view_t>> urgent_views;
     std::vector<std::unique_ptr<manager_client_t>> clients;
     std::vector<std::unique_ptr<manager_client_t>> retired_clients;
     std::vector<std::unique_ptr<tracked_output_t>> tracked_outputs;
+    wf::signal::connection_t<wf::view_hints_changed_signal> on_view_hints_changed;
+    wf::signal::connection_t<wf::view_system_bell_signal> on_view_system_bell;
+    wf::signal::connection_t<wf::view_unmapped_signal> on_view_unmapped;
+    wf::signal::connection_t<wf::view_moved_to_wset_signal> on_view_moved_to_wset;
 
     static void bind_manager(wl_client *client, void *data, uint32_t version, uint32_t id)
     {
@@ -556,6 +663,12 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         };
         output->wset()->connect(&tracked->grid_changed);
 
+        tracked->view_workspace_changed = [=] (wf::view_change_workspace_signal*)
+        {
+            broadcast_sync();
+        };
+        output->connect(&tracked->view_workspace_changed);
+
         tracked_outputs.push_back(std::move(tracked));
     }
 
@@ -591,6 +704,18 @@ class ext_workspace_manager_plugin_t : public wf::plugin_interface_t
         broadcast_sync();
     };
 };
+
+static uint32_t workspace_state(ext_workspace_manager_plugin_t *plugin,
+    std::shared_ptr<wf::workspace_set_t> wset, const workspace_key_t& key)
+{
+    auto state = workspace_base_state(wset, key);
+    if (plugin && plugin->workspace_is_urgent(key))
+    {
+        state |= EXT_WORKSPACE_HANDLE_V1_STATE_URGENT;
+    }
+
+    return state;
+}
 
 bool manager_client_t::has_live_resources() const
 {
@@ -675,7 +800,7 @@ void manager_client_t::send_workspace_details(workspace_handle_t *handle,
     auto grid = wset->get_workspace_grid_size();
     auto id = workspace_id(handle->key);
     auto name = handle->client->plugin->get_workspace_name(handle->key, grid);
-    auto state = workspace_state(wset, handle->key);
+    auto state = workspace_state(handle->client->plugin, wset, handle->key);
     auto capabilities = workspace_capabilities(wset, handle->key);
 
     if (!handle->sent_id)

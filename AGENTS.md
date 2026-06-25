@@ -80,6 +80,14 @@ Dynamic creation/removal is grid-based:
 - `remove` shrinks a rightmost column or bottom row; non-edge removal requests
   are ignored.
 
+Urgency state is plugin-tracked:
+
+- XWayland urgency hints and view-associated system bell requests mark a
+  toplevel's current workspace urgent.
+- Urgency is cleared when the toplevel activates or unmaps.
+- Workspace and workspace-set moves trigger a protocol sync so the urgent bit
+  follows the view.
+
 ## Implementation Notes
 
 - Main implementation file: `src/ext-workspace-manager.cpp`.
@@ -143,4 +151,3 @@ Expected dry-run install paths:
 ## Known Limitations
 
 - No workspace reassignment is implemented.
-- No urgency state is implemented.
