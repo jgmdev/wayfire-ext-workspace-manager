@@ -67,10 +67,10 @@ in 1-based linear grid order. Empty or missing entries use the generated
 protocol use the requested name if the configured list does not override that
 slot.
 
-`activate` is advertised on all workspaces. `remove` is advertised only for
-workspaces on a removable rightmost column or bottom row. Group capabilities
-advertise `create_workspace`. Unsupported client requests (`deactivate`,
-`assign`) are ignored.
+`activate` is advertised on all workspaces. `remove` and `assign` are
+advertised only for workspaces on a removable rightmost column or bottom row.
+Group capabilities advertise `create_workspace`. Unsupported client requests
+(`deactivate`) are ignored.
 
 Dynamic creation/removal is grid-based:
 
@@ -79,6 +79,8 @@ Dynamic creation/removal is grid-based:
   the configured name list does not override it.
 - `remove` shrinks a rightmost column or bottom row; non-edge removal requests
   are ignored.
+- `assign` grows the target workspace set by one column, moves views from the
+  source workspace to the new target workspace, then shrinks the source grid.
 
 Urgency state is plugin-tracked:
 
@@ -102,8 +104,8 @@ Urgency state is plugin-tracked:
   - `workspace_handle_t`
 - Removed protocol handles are retained in retired vectors until clients destroy
   them, so post-`removed` `destroy` requests still have valid user data.
-- `commit` applies pending removals, creations, and the last pending activation
-  per workspace set, then broadcasts a sync to clients.
+- `commit` applies pending assignments, removals, creations, and the last
+  pending activation per workspace set, then broadcasts a sync to clients.
 - `stop` sends `finished` and destroys the manager resource.
 
 ## Wayfire Signals Used
@@ -147,7 +149,3 @@ Expected dry-run install paths:
 
 - `/usr/local/lib/wayfire/libext-workspace-manager.so`
 - `/usr/share/wayfire/metadata/ext-workspace-manager.xml`
-
-## Known Limitations
-
-- No workspace reassignment is implemented.

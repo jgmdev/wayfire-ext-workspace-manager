@@ -102,15 +102,22 @@ static uint32_t workspace_base_state(std::shared_ptr<wf::workspace_set_t> wset,
     return 0;
 }
 
+static bool is_removable_workspace(std::shared_ptr<wf::workspace_set_t> wset,
+    const workspace_key_t& key)
+{
+    auto grid = wset->get_workspace_grid_size();
+    return ((key.x == grid.width - 1) && (grid.width > 1)) ||
+        ((key.y == grid.height - 1) && (grid.height > 1));
+}
+
 static uint32_t workspace_capabilities(std::shared_ptr<wf::workspace_set_t> wset,
     const workspace_key_t& key)
 {
     uint32_t capabilities = EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE;
-    auto grid = wset->get_workspace_grid_size();
-    if (((key.x == grid.width - 1) && (grid.width > 1)) ||
-        ((key.y == grid.height - 1) && (grid.height > 1)))
+    if (is_removable_workspace(wset, key))
     {
-        capabilities |= EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_REMOVE;
+        capabilities |= EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_REMOVE |
+            EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ASSIGN;
     }
 
     return capabilities;
@@ -170,6 +177,12 @@ struct current_snapshot_t
     std::map<workspace_key_t, std::shared_ptr<wf::workspace_set_t>> workspaces;
 };
 
+struct pending_assignment_t
+{
+    workspace_key_t workspace;
+    uint64_t target_wset = 0;
+};
+
 struct urgent_view_t
 {
     wayfire_toplevel_view view;
@@ -220,6 +233,7 @@ struct manager_client_t
     std::map<uint64_t, wf::point_t> pending_activation;
     std::vector<std::pair<uint64_t, std::string>> pending_creation;
     std::vector<workspace_key_t> pending_removal;
+    std::vector<pending_assignment_t> pending_assignment;
 
     manager_client_t(ext_workspace_manager_plugin_t *plugin, wl_resource *resource) :
         plugin(plugin), resource(resource)
@@ -277,8 +291,18 @@ static void handle_workspace_activate(wl_client*, wl_resource *resource)
 static void handle_workspace_noop(wl_client*, wl_resource*)
 {}
 
-static void handle_workspace_assign(wl_client*, wl_resource*, wl_resource*)
-{}
+static void handle_workspace_assign(wl_client*, wl_resource *resource, wl_resource *group_resource)
+{
+    auto *handle = static_cast<workspace_handle_t*>(wl_resource_get_user_data(resource));
+    auto *group = static_cast<group_handle_t*>(wl_resource_get_user_data(group_resource));
+    if (!handle || handle->removed || !handle->client || handle->client->stopped ||
+        !group || group->removed || (group->client != handle->client))
+    {
+        return;
+    }
+
+    handle->client->pending_assignment.push_back({handle->key, group->wset_index});
+}
 
 static void handle_workspace_remove(wl_client*, wl_resource *resource)
 {
@@ -1020,6 +1044,63 @@ void manager_client_t::commit()
 
     auto snapshot = get_current_snapshot();
 
+    for (const auto& assignment : pending_assignment)
+    {
+        if (assignment.workspace.wset == assignment.target_wset)
+        {
+            continue;
+        }
+
+        auto source = snapshot.workspaces.find(assignment.workspace);
+        auto target = snapshot.groups.find(assignment.target_wset);
+        if ((source == snapshot.workspaces.end()) || !source->second ||
+            (target == snapshot.groups.end()) || !target->second.wset)
+        {
+            continue;
+        }
+
+        auto source_wset = source->second;
+        auto target_wset = target->second.wset;
+        if (!source_wset->is_workspace_valid({assignment.workspace.x, assignment.workspace.y}) ||
+            !is_removable_workspace(source_wset, assignment.workspace))
+        {
+            continue;
+        }
+
+        auto target_grid = target_wset->get_workspace_grid_size();
+        workspace_key_t target_key{assignment.target_wset, target_grid.width, 0};
+        plugin->set_workspace_name(target_key,
+            plugin->get_workspace_name(assignment.workspace, source_wset->get_workspace_grid_size()));
+        target_wset->set_workspace_grid_size({target_grid.width + 1, target_grid.height});
+
+        auto views = source_wset->get_views(0, wf::point_t{assignment.workspace.x, assignment.workspace.y});
+        for (auto view : views)
+        {
+            if (!view)
+            {
+                continue;
+            }
+
+            auto old_wset = view->get_wset();
+            wf::start_move_view_to_wset(view, target_wset);
+            target_wset->move_to_workspace(view, {target_key.x, target_key.y});
+            wf::emit_view_moved_to_wset(view, old_wset, target_wset);
+        }
+
+        auto source_grid = source_wset->get_workspace_grid_size();
+        wf::dimensions_t next_grid = source_grid;
+        if ((assignment.workspace.x == source_grid.width - 1) && (source_grid.width > 1))
+        {
+            next_grid.width--;
+        } else if ((assignment.workspace.y == source_grid.height - 1) && (source_grid.height > 1))
+        {
+            next_grid.height--;
+        }
+
+        source_wset->set_workspace_grid_size(next_grid);
+        plugin->forget_workspace_names(assignment.workspace.wset, next_grid);
+    }
+
     for (const auto& key : pending_removal)
     {
         auto workspace = snapshot.workspaces.find(key);
@@ -1072,6 +1153,7 @@ void manager_client_t::commit()
     pending_activation.clear();
     pending_creation.clear();
     pending_removal.clear();
+    pending_assignment.clear();
     plugin->broadcast_sync();
 }
 
