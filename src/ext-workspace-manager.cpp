@@ -94,6 +94,10 @@ struct workspace_handle_t
     manager_client_t *client = nullptr;
     wl_resource *resource = nullptr;
     workspace_key_t key;
+    bool sent_id = false;
+    std::string sent_name;
+    uint32_t sent_state = 0;
+    bool sent_details = false;
     bool removed = false;
 };
 
@@ -559,25 +563,48 @@ void manager_client_t::send_workspace_details(workspace_handle_t *handle,
     auto grid = wset->get_workspace_grid_size();
     auto id = workspace_id(handle->key);
     auto name = workspace_name(handle->key, grid);
+    auto state = workspace_state(wset, handle->key);
 
-    wl_array coordinates;
-    wl_array_init(&coordinates);
-    auto *x = static_cast<uint32_t*>(wl_array_add(&coordinates, sizeof(uint32_t)));
-    auto *y = static_cast<uint32_t*>(wl_array_add(&coordinates, sizeof(uint32_t)));
-    if (x && y)
+    if (!handle->sent_id)
     {
-        *x = handle->key.x;
-        *y = handle->key.y;
-        ext_workspace_handle_v1_send_coordinates(handle->resource, &coordinates);
+        ext_workspace_handle_v1_send_id(handle->resource, id.c_str());
+        handle->sent_id = true;
     }
 
-    wl_array_release(&coordinates);
+    if (!handle->sent_details || (handle->sent_name != name))
+    {
+        ext_workspace_handle_v1_send_name(handle->resource, name.c_str());
+        handle->sent_name = name;
+    }
 
-    ext_workspace_handle_v1_send_id(handle->resource, id.c_str());
-    ext_workspace_handle_v1_send_name(handle->resource, name.c_str());
-    ext_workspace_handle_v1_send_state(handle->resource, workspace_state(wset, handle->key));
-    ext_workspace_handle_v1_send_capabilities(handle->resource,
-        EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE);
+    if (!handle->sent_details)
+    {
+        wl_array coordinates;
+        wl_array_init(&coordinates);
+        auto *x = static_cast<uint32_t*>(wl_array_add(&coordinates, sizeof(uint32_t)));
+        auto *y = static_cast<uint32_t*>(wl_array_add(&coordinates, sizeof(uint32_t)));
+        if (x && y)
+        {
+            *x = handle->key.x;
+            *y = handle->key.y;
+            ext_workspace_handle_v1_send_coordinates(handle->resource, &coordinates);
+        }
+
+        wl_array_release(&coordinates);
+    }
+
+    if (!handle->sent_details || (handle->sent_state != state))
+    {
+        ext_workspace_handle_v1_send_state(handle->resource, state);
+        handle->sent_state = state;
+    }
+
+    if (!handle->sent_details)
+    {
+        ext_workspace_handle_v1_send_capabilities(handle->resource,
+            EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE);
+        handle->sent_details = true;
+    }
 }
 
 void manager_client_t::sync_group_outputs(group_handle_t *handle, const std::set<wf::output_t*>& outputs)
